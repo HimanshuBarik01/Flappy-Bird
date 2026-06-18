@@ -1,0 +1,616 @@
+#include <SFML/Graphics.hpp>
+#include <SFML/Audio.hpp>
+#include <iostream>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
+#include <cmath>
+#include <sstream>
+#include <fstream>
+#include <algorithm>
+
+// ─────────────────────────────────────────────
+//  CONSTANTS
+// ─────────────────────────────────────────────
+const int   W           = 800;
+const int   H           = 600;
+const float GRAVITY     = 1200.f;   // pixels/s^2
+const float FLAP_VEL    = -380.f;   // upward impulse
+const float PIPE_SPEED  = 200.f;    // base pipe speed
+const float PIPE_WIDTH  = 80.f;
+const float BIRD_SIZE   = 48.f;
+const float GROUND_Y    = H - 60.f; // ground line
+
+// ─────────────────────────────────────────────
+//  ENUMS
+// ─────────────────────────────────────────────
+enum class GameState  { MENU, PLAYING, PAUSED, GAMEOVER };
+enum class Difficulty { EASY, MEDIUM, HARD };
+
+// ─────────────────────────────────────────────
+//  HELPER: center text
+// ─────────────────────────────────────────────
+static void centerText(sf::Text& t, float cx, float cy) {
+    sf::FloatRect r = t.getLocalBounds();
+    t.setOrigin(r.left + r.width / 2.f, r.top + r.height / 2.f);
+    t.setPosition(cx, cy);
+}
+
+// ─────────────────────────────────────────────
+//  BIRD CLASS
+// ─────────────────────────────────────────────
+class Bird {
+    sf::Sprite  sprite;
+    float       velY;
+    float       rotation;
+
+public:
+    Bird() : velY(0.f), rotation(0.f) {}
+
+    void setTexture(const sf::Texture& tex) {
+        sprite.setTexture(tex);
+        sf::FloatRect b = sprite.getLocalBounds();
+        sprite.setScale(BIRD_SIZE / b.width, BIRD_SIZE / b.height);
+        sprite.setOrigin(b.width / 2.f, b.height / 2.f);
+        sprite.setPosition(180.f, H / 2.f);
+    }
+
+    void reset() {
+        velY     = 0.f;
+        rotation = 0.f;
+        sprite.setPosition(180.f, H / 2.f);
+        sprite.setRotation(0.f);
+    }
+
+    void flap() { velY = FLAP_VEL; }
+
+    void update(float dt) {
+        velY += GRAVITY * dt;
+        sprite.move(0.f, velY * dt);
+
+        // Tilt: nose up when going up, nose down when falling
+        float targetRot = std::min(velY * 0.06f, 80.f);
+        rotation += (targetRot - rotation) * 10.f * dt;
+        sprite.setRotation(rotation);
+    }
+
+    sf::FloatRect getBounds() const {
+        // Shrink hitbox slightly
+        sf::FloatRect b = sprite.getGlobalBounds();
+        b.left   += 6.f; b.top    += 6.f;
+        b.width  -= 12.f; b.height -= 12.f;
+        return b;
+    }
+
+    float getY() const { return sprite.getPosition().y; }
+    float getX() const { return sprite.getPosition().x; }
+
+    void draw(sf::RenderWindow& window) const { window.draw(sprite); }
+};
+
+// ─────────────────────────────────────────────
+//  PIPE PAIR CLASS
+// ─────────────────────────────────────────────
+class PipePair {
+    sf::Sprite  topPipe;
+    sf::Sprite  botPipe;
+    float       x;
+    float       gapY;       // center of gap
+    float       gapSize;
+    float       speed;
+    float       oscillation; // amplitude for vertical movement (hard mode)
+    float       oscTime;
+    bool        scored;
+
+    static const sf::Texture* texPtr;
+
+public:
+    bool isScored() const { return scored; }
+    void setScored()      { scored = true; }
+    float getX()    const { return x; }
+    bool  isOffScreen() const { return x + PIPE_WIDTH < 0.f; }
+
+    PipePair(float startX, float gapCenterY, float gap, float spd, float oscAmp)
+        : x(startX), gapY(gapCenterY), gapSize(gap), speed(spd),
+          oscillation(oscAmp), oscTime(0.f), scored(false)
+    {
+        if (texPtr) {
+            // Top pipe (flipped)
+            topPipe.setTexture(*texPtr);
+            sf::FloatRect tb = topPipe.getLocalBounds();
+            topPipe.setScale(PIPE_WIDTH / tb.width, 1.f);
+            topPipe.setOrigin(0.f, 0.f);
+
+            // Bottom pipe
+            botPipe.setTexture(*texPtr);
+            sf::FloatRect bb = botPipe.getLocalBounds();
+            botPipe.setScale(PIPE_WIDTH / bb.width, 1.f);
+        }
+        updatePositions();
+    }
+
+    static void setTexture(const sf::Texture& tex) { texPtr = &tex; }
+
+    void update(float dt) {
+        oscTime += dt;
+        if (oscillation > 0.f)
+            gapY += std::sin(oscTime * 2.f) * oscillation * dt * 60.f;
+
+        // Clamp gapY so pipes stay on screen
+        float half = gapSize / 2.f;
+        gapY = std::max(gapY, half + 40.f);
+        gapY = std::min(gapY, GROUND_Y - half - 10.f);
+
+        x -= speed * dt;
+        updatePositions();
+    }
+
+    void updatePositions() {
+        float half      = gapSize / 2.f;
+        float topBottom = gapY - half;   // bottom of top pipe
+        float botTop    = gapY + half;   // top of bottom pipe
+
+        if (texPtr) {
+            sf::FloatRect tb = topPipe.getLocalBounds();
+            float scaleY = topBottom / tb.height;
+            topPipe.setScale(PIPE_WIDTH / tb.width, scaleY);
+            topPipe.setPosition(x, 0.f);
+
+            float botHeight = GROUND_Y - botTop;
+            sf::FloatRect bb = botPipe.getLocalBounds();
+            float scaleY2 = botHeight / bb.height;
+            botPipe.setScale(PIPE_WIDTH / bb.width, scaleY2);
+            botPipe.setPosition(x, botTop);
+        }
+    }
+
+    bool collides(const sf::FloatRect& bird) const {
+        sf::FloatRect tp = topPipe.getGlobalBounds();
+        sf::FloatRect bp = botPipe.getGlobalBounds();
+        return bird.intersects(tp) || bird.intersects(bp);
+    }
+
+    // Fallback rectangles when no texture
+    void drawFallback(sf::RenderWindow& window) const {
+        float half    = gapSize / 2.f;
+        float topH    = gapY - half;
+        float botTop  = gapY + half;
+
+        sf::RectangleShape t(sf::Vector2f(PIPE_WIDTH, topH));
+        t.setPosition(x, 0.f);
+        t.setFillColor(sf::Color(34, 180, 34));
+        window.draw(t);
+
+        sf::RectangleShape b(sf::Vector2f(PIPE_WIDTH, GROUND_Y - botTop));
+        b.setPosition(x, botTop);
+        b.setFillColor(sf::Color(34, 180, 34));
+        window.draw(b);
+    }
+
+    void draw(sf::RenderWindow& window, bool hasTexture) const {
+        if (hasTexture) {
+            window.draw(topPipe);
+            window.draw(botPipe);
+        } else {
+            drawFallback(window);
+        }
+    }
+};
+const sf::Texture* PipePair::texPtr = nullptr;
+
+// ─────────────────────────────────────────────
+//  HUD
+// ─────────────────────────────────────────────
+class HUD {
+    sf::Font& font;
+    sf::Text  scoreText, highText, diffText;
+public:
+    explicit HUD(sf::Font& f) : font(f) {
+        scoreText.setFont(font);
+        scoreText.setCharacterSize(36);
+        scoreText.setFillColor(sf::Color::Black);
+        scoreText.setStyle(sf::Text::Bold);
+        scoreText.setPosition(20.f, 10.f);
+
+        highText.setFont(font);
+        highText.setCharacterSize(28);
+        highText.setFillColor(sf::Color(80, 0, 0));
+        highText.setStyle(sf::Text::Bold);
+        highText.setPosition(W - 260.f, 10.f);
+
+        diffText.setFont(font);
+        diffText.setCharacterSize(20);
+        diffText.setFillColor(sf::Color(0, 80, 0));
+        diffText.setPosition(20.f, 54.f);
+    }
+
+    void update(int score, int high, Difficulty diff) {
+        std::ostringstream ss; ss << "SCORE: " << score;
+        scoreText.setString(ss.str());
+
+        std::ostringstream sh; sh << "HIGH SCORE: " << high;
+        highText.setString(sh.str());
+
+        std::string ds = (diff == Difficulty::EASY) ? "EASY" :
+                         (diff == Difficulty::MEDIUM) ? "MEDIUM" : "HARD";
+        diffText.setString("LVL: " + ds);
+    }
+
+    void draw(sf::RenderWindow& w) {
+        w.draw(scoreText); w.draw(highText); w.draw(diffText);
+    }
+};
+
+// ─────────────────────────────────────────────
+//  HIGH SCORE FILE I/O
+// ─────────────────────────────────────────────
+static int loadHighScore() {
+    std::ifstream f("highscore.txt");
+    int val = 0;
+    if (f.is_open()) f >> val;
+    return val;
+}
+static void saveHighScore(int val) {
+    std::ofstream f("highscore.txt");
+    if (f.is_open()) f << val;
+}
+
+// ─────────────────────────────────────────────
+//  GAME CLASS
+// ─────────────────────────────────────────────
+class Game {
+    sf::RenderWindow window;
+    sf::Font         font;
+
+    sf::Texture birdTex;
+    sf::Texture pipeTex;
+    bool        birdTexLoaded;
+    bool        pipeTexLoaded;
+
+    Bird                    bird;
+    std::vector<PipePair>   pipes;
+
+    GameState  state;
+    Difficulty difficulty;
+
+    int   score;
+    int   highScore;
+    float pipeTimer;
+    float pipeInterval;
+    float pipeSpeed;
+    float gapSize;
+    float oscAmp;
+
+    // Scrolling sky background
+    sf::RectangleShape skyRect;
+    // Ground
+    sf::RectangleShape groundRect;
+    sf::RectangleShape groundTop;
+
+    // Audio
+    sf::SoundBuffer flapBuf, collBuf;
+    sf::Sound       flapSound, collSound;
+    sf::Music       bgMusic;
+    bool            flapLoaded, collLoaded, musicLoaded;
+
+    // UI texts
+    sf::Text titleText, menuText, pauseText;
+    sf::Text overText, overScore, overHigh, restartText;
+
+    // ── difficulty ───────────────────────────
+    void applyDifficulty() {
+        switch (difficulty) {
+            case Difficulty::EASY:
+                gapSize      = 200.f;
+                pipeSpeed    = 180.f;
+                pipeInterval = 2.2f;
+                oscAmp       = 0.f;
+                break;
+            case Difficulty::MEDIUM:
+                gapSize      = 160.f;
+                pipeSpeed    = 230.f;
+                pipeInterval = 1.8f;
+                oscAmp       = 0.f;
+                break;
+            case Difficulty::HARD:
+                gapSize      = 130.f;
+                pipeSpeed    = 290.f;
+                pipeInterval = 1.4f;
+                oscAmp       = 1.2f;  // vertical oscillation
+                break;
+        }
+    }
+
+    void spawnPipe() {
+        float minGapY = gapSize / 2.f + 50.f;
+        float maxGapY = GROUND_Y - gapSize / 2.f - 20.f;
+        float gapCY   = minGapY + (float)(rand() % (int)(maxGapY - minGapY));
+        pipes.emplace_back((float)W + 10.f, gapCY, gapSize, pipeSpeed, oscAmp);
+    }
+
+    void resetGame() {
+        pipes.clear();
+        score      = 0;
+        pipeTimer  = 0.f;
+        applyDifficulty();
+        bird.reset();
+        state = GameState::PLAYING;
+        if (musicLoaded) bgMusic.play();
+    }
+
+    void buildUI() {
+        titleText.setFont(font);
+        titleText.setString("FLAPPY BIRD");
+        titleText.setCharacterSize(58);
+        titleText.setFillColor(sf::Color(255, 200, 0));
+        titleText.setStyle(sf::Text::Bold);
+        centerText(titleText, W / 2.f, 160.f);
+
+        menuText.setFont(font);
+        menuText.setString("[ 1 ] EASY\n[ 2 ] MEDIUM\n[ 3 ] HARD\n\nPress number to start!");
+        menuText.setCharacterSize(26);
+        menuText.setFillColor(sf::Color::White);
+        menuText.setLineSpacing(1.6f);
+        centerText(menuText, W / 2.f, 340.f);
+
+        pauseText.setFont(font);
+        pauseText.setString("PAUSED\n\nP = Resume\nR = Restart");
+        pauseText.setCharacterSize(34);
+        pauseText.setFillColor(sf::Color::White);
+        pauseText.setLineSpacing(1.5f);
+        centerText(pauseText, W / 2.f, H / 2.f);
+
+        overText.setFont(font);
+        overText.setString("GAME OVER");
+        overText.setCharacterSize(56);
+        overText.setFillColor(sf::Color::Red);
+        overText.setStyle(sf::Text::Bold);
+        centerText(overText, W / 2.f, 200.f);
+
+        overScore.setFont(font);
+        overScore.setCharacterSize(32);
+        overScore.setFillColor(sf::Color::White);
+        centerText(overScore, W / 2.f, 300.f);
+
+        overHigh.setFont(font);
+        overHigh.setCharacterSize(28);
+        overHigh.setFillColor(sf::Color::Yellow);
+        centerText(overHigh, W / 2.f, 350.f);
+
+        restartText.setFont(font);
+        restartText.setString("R = Play Again   |   Esc = Quit");
+        restartText.setCharacterSize(24);
+        restartText.setFillColor(sf::Color::Cyan);
+        centerText(restartText, W / 2.f, 430.f);
+    }
+
+    void drawOverlay(sf::Color col = sf::Color(0, 0, 0, 160)) {
+        sf::RectangleShape ov(sf::Vector2f(W, H));
+        ov.setFillColor(col);
+        window.draw(ov);
+    }
+
+    // ── events ───────────────────────────────
+    void handleEvents() {
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == sf::Event::Closed) window.close();
+            if (event.type == sf::Event::KeyPressed) {
+                if (event.key.code == sf::Keyboard::Escape) window.close();
+
+                if (state == GameState::MENU) {
+                    if      (event.key.code == sf::Keyboard::Num1) { difficulty = Difficulty::EASY;   resetGame(); }
+                    else if (event.key.code == sf::Keyboard::Num2) { difficulty = Difficulty::MEDIUM; resetGame(); }
+                    else if (event.key.code == sf::Keyboard::Num3) { difficulty = Difficulty::HARD;   resetGame(); }
+                }
+
+                if (state == GameState::PLAYING) {
+                    if (event.key.code == sf::Keyboard::Space ||
+                        event.key.code == sf::Keyboard::Up) {
+                        bird.flap();
+                        if (flapLoaded) flapSound.play();
+                    }
+                    if (event.key.code == sf::Keyboard::P) {
+                        state = GameState::PAUSED;
+                        if (musicLoaded) bgMusic.pause();
+                    }
+                }
+
+                if (state == GameState::PAUSED) {
+                    if (event.key.code == sf::Keyboard::P) {
+                        state = GameState::PLAYING;
+                        if (musicLoaded) bgMusic.play();
+                    }
+                    if (event.key.code == sf::Keyboard::R) resetGame();
+                }
+
+                if (state == GameState::GAMEOVER) {
+                    if (event.key.code == sf::Keyboard::R) state = GameState::MENU;
+                }
+            }
+        }
+    }
+
+    // ── update ───────────────────────────────
+    void update(float dt) {
+        if (state != GameState::PLAYING) return;
+
+        bird.update(dt);
+
+        // Ground / ceiling collision
+        if (bird.getY() + BIRD_SIZE / 2.f >= GROUND_Y ||
+            bird.getY() - BIRD_SIZE / 2.f <= 0.f) {
+            triggerGameOver();
+            return;
+        }
+
+        // Spawn pipes
+        pipeTimer += dt;
+        if (pipeTimer >= pipeInterval) {
+            pipeTimer = 0.f;
+            spawnPipe();
+        }
+
+        // Update pipes
+        for (auto& p : pipes) p.update(dt);
+
+        // Score: bird passed pipe centre
+        sf::FloatRect birdBounds = bird.getBounds();
+        for (auto& p : pipes) {
+            if (!p.isScored() && p.getX() + PIPE_WIDTH < bird.getX()) {
+                p.setScored();
+                ++score;
+                if (score > highScore) {
+                    highScore = score;
+                    saveHighScore(highScore);
+                }
+            }
+            // Collision
+            if (p.collides(birdBounds)) {
+                triggerGameOver();
+                return;
+            }
+        }
+
+        // Remove off-screen pipes
+        pipes.erase(
+            std::remove_if(pipes.begin(), pipes.end(),
+                [](const PipePair& p) { return p.isOffScreen(); }),
+            pipes.end());
+    }
+
+    void triggerGameOver() {
+        if (collLoaded) collSound.play();
+        if (musicLoaded) bgMusic.stop();
+        state = GameState::GAMEOVER;
+
+        std::ostringstream ss; ss << "SCORE: " << score;
+        overScore.setString(ss.str());
+        centerText(overScore, W / 2.f, 300.f);
+
+        std::ostringstream sh; sh << "HIGH SCORE: " << highScore;
+        overHigh.setString(sh.str());
+        centerText(overHigh, W / 2.f, 350.f);
+    }
+
+    // ── render ───────────────────────────────
+    void render() {
+        window.clear(sf::Color(112, 197, 206)); // sky blue
+
+        if (state == GameState::MENU) {
+            window.draw(groundRect);
+            window.draw(groundTop);
+            drawOverlay(sf::Color(0, 0, 0, 100));
+            window.draw(titleText);
+            window.draw(menuText);
+
+            sf::Text hint; hint.setFont(font);
+            hint.setString("Space / Up = Flap   |   P = Pause   |   Esc = Quit");
+            hint.setCharacterSize(16);
+            hint.setFillColor(sf::Color(220, 220, 220));
+            centerText(hint, W / 2.f, H - 25.f);
+            window.draw(hint);
+
+        } else if (state == GameState::PLAYING || state == GameState::PAUSED) {
+            for (auto& p : pipes) p.draw(window, pipeTexLoaded);
+            window.draw(groundRect);
+            window.draw(groundTop);
+            bird.draw(window);
+            hudObj->update(score, highScore, difficulty);
+            hudObj->draw(window);
+            if (state == GameState::PAUSED) { drawOverlay(); window.draw(pauseText); }
+
+        } else if (state == GameState::GAMEOVER) {
+            for (auto& p : pipes) p.draw(window, pipeTexLoaded);
+            window.draw(groundRect);
+            window.draw(groundTop);
+            bird.draw(window);
+            hudObj->draw(window);
+            drawOverlay();
+            window.draw(overText);
+            window.draw(overScore);
+            window.draw(overHigh);
+            window.draw(restartText);
+        }
+
+        window.display();
+    }
+
+    HUD* hudObj;
+
+public:
+    Game() :
+        window(sf::VideoMode(W, H), "Flappy!!!", sf::Style::Close | sf::Style::Titlebar),
+        birdTexLoaded(false), pipeTexLoaded(false),
+        state(GameState::MENU), difficulty(Difficulty::MEDIUM),
+        score(0), highScore(0),
+        pipeTimer(0.f), pipeInterval(1.8f),
+        pipeSpeed(230.f), gapSize(160.f), oscAmp(0.f),
+        flapLoaded(false), collLoaded(false), musicLoaded(false),
+        hudObj(nullptr)
+    {
+        srand((unsigned)time(nullptr));
+        window.setFramerateLimit(60);
+
+        // Font
+        if (!font.loadFromFile("arial.ttf"))
+            if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"))
+                font.loadFromFile("C:/Windows/Fonts/arial.ttf");
+
+        // ── Textures ──────────────────────────────────────────────────
+        if (!birdTex.loadFromFile("Bird.png"))
+            std::cerr << "[WARN] bird.png not found.\n";
+        else
+            birdTexLoaded = true;
+
+        if (!pipeTex.loadFromFile("Pipes.png"))
+            std::cerr << "[WARN] pipe.png not found.\n";
+        else {
+            pipeTexLoaded = true;
+            PipePair::setTexture(pipeTex);
+        }
+        // ──────────────────────────────────────────────────────────────
+
+        if (birdTexLoaded) bird.setTexture(birdTex);
+
+        // Ground
+        groundRect.setSize(sf::Vector2f(W, H - GROUND_Y));
+        groundRect.setPosition(0.f, GROUND_Y);
+        groundRect.setFillColor(sf::Color(222, 184, 135));
+
+        groundTop.setSize(sf::Vector2f(W, 6.f));
+        groundTop.setPosition(0.f, GROUND_Y);
+        groundTop.setFillColor(sf::Color(100, 180, 60));
+
+        // Audio
+        if (flapBuf.loadFromFile("flap.wav"))      { flapSound.setBuffer(flapBuf); flapLoaded = true; }
+        if (collBuf.loadFromFile("collision.wav"))  { collSound.setBuffer(collBuf); collLoaded = true; }
+        if (bgMusic.openFromFile("bgmusic.ogg"))    { bgMusic.setLoop(true); musicLoaded = true; }
+
+        highScore = loadHighScore();
+        hudObj    = new HUD(font);
+        buildUI();
+    }
+
+    ~Game() { delete hudObj; }
+
+    void run() {
+        sf::Clock clock;
+        while (window.isOpen()) {
+            float dt = clock.restart().asSeconds();
+            if (dt > 0.05f) dt = 0.05f;
+            handleEvents();
+            update(dt);
+            render();
+        }
+    }
+};
+
+// ─────────────────────────────────────────────
+//  MAIN
+// ─────────────────────────────────────────────
+int main() {
+    Game game;
+    game.run();
+    return 0;
+}
